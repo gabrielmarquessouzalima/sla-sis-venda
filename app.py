@@ -1,229 +1,363 @@
 import sqlite3
+import os
+import hashlib
+import shutil
+import csv
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, List
 
-# --- CONFIGURAÇÃO DO BANCO DE DADOS ---
-# Mude de 'sistema_vendas.db' para 'sistema_vendas_v2.db'
-DB_NAME = 'sistema_vendas_v2.db'
+# --- CONFIGURAÇÃO ---
+DB_NAME = 'comercial_v31.db'#nao alterar
+BACKUP_DIR = 'backups'
 
-def inicializar_db():
-    """Cria o banco de dados e as tabelas necessárias se não existirem."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        
-        # Tabela de Usuários (com campo CARGO)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS usuarios (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                usuario TEXT UNIQUE NOT NULL,
-                senha TEXT NOT NULL,
-                cargo TEXT NOT NULL
-            )
-        ''')
-        
-        # Tabela de Produtos
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS produtos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                preco REAL NOT NULL,
-                estoque INTEGER NOT NULL
-            )
-        ''')
-        
-        # Tabela de Vendas (Saídas)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vendas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                produto_id INTEGER,
-                quantidade INTEGER,
-                total REAL,
-                data TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (produto_id) REFERENCES produtos (id)
-            )
-        ''')
-
-        # Tabela de Compras (Entradas)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS compras (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                produto_id INTEGER,
-                quantidade INTEGER,
-                custo_total REAL,
-                data TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (produto_id) REFERENCES produtos (id)
-            )
-        ''')
-        conn.commit()
-
-# --- FUNÇÕES DE AUTENTICAÇÃO ---
-
-def cadastrar_usuario():
-    print("\n--- CADASTRO DE NOVO USUÁRIO ---")
-    user = input("Nome de usuário: ")
-    senha = input("Senha: ")
-    print("Defina o cargo: (1) Administrador | (2) Vendedor")
-    tipo = input("Opção: ")
-    cargo = 'admin' if tipo == '1' else 'vendedor'
+class SistemaComercial:
+    def __init__(self):
+        if not os.path.exists(BACKUP_DIR):
+            os.makedirs(BACKUP_DIR)
+        self.inicializar_db_completo()
+        self.criar_usuario_padrao()
     
-    try:
+    def hash_senha(self, senha: str) -> str:
+        salt = "sistema_comercial_v4_2024"
+        return hashlib.sha256((senha + salt).encode()).hexdigest()
+    
+    def inicializar_db_completo(self):
+        """Cria/atualiza TODAS as tabelas corretamente"""
         with sqlite3.connect(DB_NAME) as conn:
             cursor = conn.cursor()
-            cursor.execute('INSERT INTO usuarios (usuario, senha, cargo) VALUES (?, ?, ?)', (user, senha, cargo))
+            
+            # 1. USUÁRIOS
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS usuarios (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    usuario TEXT UNIQUE NOT NULL,
+                    senha TEXT NOT NULL,
+                    cargo TEXT NOT NULL CHECK (cargo IN ('admin', 'vendedor')),
+                    data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # 2. PRODUTOS
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS produtos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT NOT NULL,
+                    preco REAL NOT NULL CHECK (preco > 0),
+                    estoque INTEGER NOT NULL DEFAULT 0 CHECK (estoque >= 0),
+                    data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # 3. VENDAS (CORRIGIDO - com coluna usuario)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS vendas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    produto_id INTEGER NOT NULL,
+                    quantidade INTEGER NOT NULL CHECK (quantidade > 0),
+                    total REAL NOT NULL CHECK (total > 0),
+                    usuario TEXT NOT NULL,
+                    data TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (produto_id) REFERENCES produtos (id)
+                )
+            ''')
+            
+            # 4. COMPRAS
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS compras (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    produto_id INTEGER NOT NULL,
+                    quantidade INTEGER NOT NULL CHECK (quantidade > 0),
+                    custo_unitario REAL NOT NULL CHECK (custo_unitario > 0),
+                    custo_total REAL NOT NULL CHECK (custo_total > 0),
+                    usuario TEXT NOT NULL,
+                    data TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (produto_id) REFERENCES produtos (id)
+                )
+            ''')
+            
             conn.commit()
-            print(f"\n✅ Usuário '{user}' cadastrado como {cargo}!")
-    except sqlite3.IntegrityError:
-        print("\n❌ Erro: Este usuário já existe no sistema.")
-
-def fazer_login():
-    print("\n--- LOGIN ---")
-    user = input("Usuário: ")
-    senha = input("Senha: ")
+            print("✅ Banco de dados inicializado!")
     
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT cargo FROM usuarios WHERE usuario = ? AND senha = ?', (user, senha))
-        resultado = cursor.fetchone()
-        if resultado:
-            return resultado[0]  # Retorna 'admin' ou 'vendedor'
-        return None
-
-# --- FUNÇÕES DE PRODUTOS ---
-
-def listar_produtos():
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM produtos')
-        produtos = cursor.fetchall()
+    def criar_usuario_padrao(self):
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM usuarios WHERE usuario = 'admin'")
+            if not cursor.fetchone():
+                senha_hash = self.hash_senha('admin123')
+                cursor.execute(
+                    "INSERT INTO usuarios (usuario, senha, cargo) VALUES (?, ?, ?)",
+                    ('admin', senha_hash, 'admin')
+                )
+                conn.commit()
+    
+    # --- AUTENTICAÇÃO ---
+    def fazer_login(self) -> Optional[Tuple[str, str]]:
+        print("\n" + "="*35)
+        print("           🔐 LOGIN")
+        print("="*35)
         
-        print("\n" + "="*55)
-        print(f"{'ID':<4} | {'Nome':<20} | {'Preço (Venda)':<12} | {'Estoque'}")
-        print("-" * 55)
-        for p in produtos:
-            print(f"{p[0]:<4} | {p[1]:<20} | R$ {p[2]:<9.2f} | {p[3]}")
-        print("="*55)
-
-def realizar_venda(produto_id, quantidade):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT nome, preco, estoque FROM produtos WHERE id = ?', (produto_id,))
-        produto = cursor.fetchone()
+        usuario = input("👤 Usuário: ").strip()
+        senha = input("🔒 Senha: ").strip()
         
-        if produto and produto[2] >= quantidade:
-            total = produto[1] * quantidade
-            cursor.execute('UPDATE produtos SET estoque = estoque - ? WHERE id = ?', (quantidade, produto_id))
-            cursor.execute('INSERT INTO vendas (produto_id, quantidade, total) VALUES (?, ?, ?)', (produto_id, quantidade, total))
-            conn.commit()
-            print(f"\n💰 Venda concluída! Item: {produto[0]} | Total: R$ {total:.2f}")
-        else:
-            print("\n❌ Erro: Produto não encontrado ou estoque insuficiente.")
-
-def registrar_compra(produto_id, quantidade, custo_total):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT nome FROM produtos WHERE id = ?', (produto_id,))
-        produto = cursor.fetchone()
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT usuario, cargo FROM usuarios WHERE usuario = ? AND senha = ?',
+                (usuario, self.hash_senha(senha))
+            )
+            resultado = cursor.fetchone()
+            return resultado
+    
+    def cadastrar_usuario(self):
+        print("\n" + "="*40)
+        print("         ➕ NOVO USUÁRIO")
+        print("="*40)
         
-        if produto:
-            cursor.execute('UPDATE produtos SET estoque = estoque + ? WHERE id = ?', (quantidade, produto_id))
-            cursor.execute('INSERT INTO compras (produto_id, quantidade, custo_total) VALUES (?, ?, ?)', (produto_id, quantidade, custo_total))
-            conn.commit()
-            print(f"\n📦 Estoque de '{produto[0]}' abastecido com sucesso!")
-        else:
-            print("\n❌ Erro: Produto não cadastrado.")
-
-# --- MENUS ---
-
-def menu_vendedor():
-    """Acesso limitado: Vendedor só vê estoque e vende."""
-    while True:
-        print("\n--- 🛒 PAINEL DO VENDEDOR ---")
-        print("1. Consultar Estoque")
-        print("2. Registrar Venda")
-        print("3. Fazer Logout")
-        op = input("\nEscolha uma opção: ")
-        
-        if op == '1':
-            listar_produtos()
-        elif op == '2':
-            listar_produtos()
-            try:
-                id_p = int(input("ID do Produto: "))
-                q = int(input("Quantidade: "))
-                realizar_venda(id_p, q)
-            except ValueError:
-                print("⚠️ Erro: Digite apenas números.")
-        elif op == '3':
-            break
-
-def menu_admin():
-    """Acesso total: Gerente faz tudo."""
-    while True:
-        print("\n--- 🛡️ PAINEL ADMINISTRATIVO ---")
-        print("1. Cadastrar Novo Produto")
-        print("2. Ver Estoque")
-        print("3. Registrar Venda (Saída)")
-        print("4. Registrar Compra (Entrada de Estoque)")
-        print("5. Fazer Logout")
-        op = input("\nEscolha uma opção: ")
+        usuario = input("👤 Nome de usuário: ").strip()
+        senha = input("🔒 Senha: ").strip()
+        print("📋 Cargo: 1=Admin | 2=Vendedor")
+        cargo = input("Opção: ").strip()
+        cargo_final = 'admin' if cargo == '1' else 'vendedor'
         
         try:
-            if op == '1':
-                n = input("Nome do Produto: ")
-                p = float(input("Preço de Venda: "))
-                e = int(input("Estoque Inicial: "))
-                with sqlite3.connect(DB_NAME) as conn:
-                    conn.execute('INSERT INTO produtos (nome, preco, estoque) VALUES (?,?,?)', (n, p, e))
-                print(f"✅ Produto '{n}' cadastrado!")
-            elif op == '2':
-                listar_produtos()
-            elif op == '3':
-                listar_produtos()
-                id_p = int(input("ID do Produto: "))
-                q = int(input("Qtd: "))
-                realizar_venda(id_p, q)
-            elif op == '4':
-                listar_produtos()
-                id_p = int(input("ID do Produto para Reposição: "))
-                q = int(input("Qtd comprada: "))
-                c = float(input("Custo Total da Compra R$: "))
-                registrar_compra(id_p, q, c)
-            elif op == '5':
-                break
-            else:
-                print("Opção inválida.")
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'INSERT INTO usuarios (usuario, senha, cargo) VALUES (?, ?, ?)',
+                    (usuario, self.hash_senha(senha), cargo_final)
+                )
+                conn.commit()
+            print(f"✅ '{usuario}' criado como {cargo_final.upper()}!")
+        except sqlite3.IntegrityError:
+            print("❌ Usuário já existe!")
+    
+    # --- PRODUTOS ---
+    def listar_produtos(self):
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM produtos ORDER BY nome')
+            produtos = cursor.fetchall()
+            
+            if not produtos:
+                print("\n📦 Nenhum produto!")
+                return
+            
+            print("\n" + "="*60)
+            print(f"{'ID':<4} | {'PRODUTO':<20} | {'PREÇO R$':<10} | {'ESTOQUE'}")
+            print("-"*60)
+            for p in produtos:
+                status = "🚨" if p[3] < 10 else "✅"
+                print(f"{p[0]:<4} | {p[1]:<20} | {p[2]:<9.2f} | {p[3]:<8} {status}")
+            print("="*60)
+    
+    def estoque_critico(self):
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT nome, estoque FROM produtos WHERE estoque < 10 ORDER BY estoque')
+            criticos = cursor.fetchall()
+            if criticos:
+                print("\n⚠️  ESTOQUE CRÍTICO:")
+                for p in criticos:
+                    print(f"🚨 {p[0]}: {p[1]} unidades")
+    
+    def cadastrar_produto(self):
+        print("\n📦 NOVO PRODUTO")
+        nome = input("Nome: ").strip()
+        try:
+            preco = float(input("Preço R$: "))
+            estoque = int(input("Estoque inicial: "))
+            
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'INSERT INTO produtos (nome, preco, estoque) VALUES (?, ?, ?)',
+                    (nome, preco, estoque)
+                )
+                conn.commit()
+            print(f"✅ '{nome}' cadastrado!")
         except ValueError:
-            print("⚠️ Erro: Entrada inválida. Use apenas números para preços e quantidades.")
-
-# --- FLUXO PRINCIPAL ---
-
-def main():
-    inicializar_db()
-    while True:
-        print("\n" + "="*30)
-        print("   SISTEMA COMERCIAL 2.0")
-        print("="*30)
-        print("1. Fazer Login")
-        print("2. Criar Nova Conta")
-        print("3. Sair do Sistema")
+            print("❌ Números inválidos!")
+    
+    # --- OPERAÇÕES ---
+    def realizar_venda(self, produto_id: int, quantidade: int, usuario: str):
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT nome, preco, estoque FROM produtos WHERE id = ?', (produto_id,))
+            produto = cursor.fetchone()
+            
+            if not produto:
+                print("❌ Produto não encontrado!")
+                return
+            
+            if produto[2] < quantidade:
+                print(f"❌ Estoque insuficiente! {produto[2]} disponíveis")
+                return
+            
+            total = produto[1] * quantidade
+            cursor.execute('UPDATE produtos SET estoque = estoque - ? WHERE id = ?', (quantidade, produto_id))
+            cursor.execute(
+                'INSERT INTO vendas (produto_id, quantidade, total, usuario) VALUES (?, ?, ?, ?)',
+                (produto_id, quantidade, total, usuario)
+            )
+            conn.commit()
+            
+            print(f"\n💰 VENDA OK!")
+            print(f"   {produto[0]} x{quantidade} = R${total:.2f}")
+    
+    def registrar_compra(self, produto_id: int, quantidade: int, custo_total: float, usuario: str):
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT nome FROM produtos WHERE id = ?', (produto_id,))
+            produto = cursor.fetchone()
+            
+            if not produto:
+                print("❌ Produto não encontrado!")
+                return
+            
+            custo_unit = custo_total / quantidade
+            cursor.execute('UPDATE produtos SET estoque = estoque + ? WHERE id = ?', (quantidade, produto_id))
+            cursor.execute(
+                'INSERT INTO compras (produto_id, quantidade, custo_unitario, custo_total, usuario) VALUES (?, ?, ?, ?, ?)',
+                (produto_id, quantidade, custo_unit, custo_total, usuario)
+            )
+            conn.commit()
+            
+            print(f"\n📦 COMPRA OK!")
+            print(f"   {produto[0]} x{quantidade} = R${custo_total:.2f}")
+    
+    # --- RELATÓRIOS ---
+    def relatorio_vendas(self):
+        hoje = datetime.now().strftime('%Y-%m-%d')
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT p.nome, v.quantidade, v.total, v.data, v.usuario
+                FROM vendas v JOIN produtos p ON v.produto_id = p.id 
+                WHERE DATE(v.data) = ? ORDER BY v.data DESC
+            ''', (hoje,))
+            vendas = cursor.fetchall()
+            
+            if not vendas:
+                print("\n📊 Nenhuma venda hoje!")
+                return
+            
+            print("\n" + "="*70)
+            print(f"{'PRODUTO':<20} | {'QTD':<5} | {'TOTAL':<10} | {'USUÁRIO':<10} | {'DATA'}")
+            print("-"*70)
+            total_dia = 0
+            for v in vendas:
+                print(f"{v[0]:<20} | {v[1]:<5} | R${v[2]:<9.2f} | {v[4]:<10} | {v[3][:16]}")
+                total_dia += v[2]
+            print("-"*70)
+            print(f"{'TOTAL DO DIA:':<45} R$ {total_dia:>9.2f}")
+            print("="*70)
+    
+    # --- MENUS ---
+    def menu_vendedor(self, usuario: str):
+        while True:
+            print("\n" + "="*40)
+            print(f"     🛒 VENDEDOR: {usuario}")
+            print("="*40)
+            print("1. 📋 Estoque")
+            print("2. 💰 Venda")
+            print("3. 📊 Vendas Hoje")
+            print("4. 🚪 Sair")
+            
+            op = input("\n👉 ").strip()
+            if op == '1':
+                self.listar_produtos()
+                self.estoque_critico()
+            elif op == '2':
+                self.listar_produtos()
+                try:
+                    pid = int(input("ID: "))
+                    qtd = int(input("Qtd: "))
+                    self.realizar_venda(pid, qtd, usuario)
+                except:
+                    print("❌ Erro!")
+            elif op == '3':
+                self.relatorio_vendas()
+            elif op == '4':
+                break
+            input("\n⏸️ Enter...")
+    
+    def menu_admin(self, usuario: str):
+        while True:
+            print("\n" + "="*45)
+            print(f"   🛡️ ADMIN: {usuario}")
+            print("="*45)
+            print("1. ➕ Produto")
+            print("2. 📋 Estoque")
+            print("3. 💰 Venda")
+            print("4. 📦 Compra")
+            print("5. 📊 Relatório")
+            print("6. 👥 Usuário")
+            print("7. 🚪 Sair")
+            
+            op = input("\n👉 ").strip()
+            if op == '1':
+                self.cadastrar_produto()
+            elif op == '2':
+                self.listar_produtos()
+                self.estoque_critico()
+            elif op == '3':
+                self.listar_produtos()
+                try:
+                    pid = int(input("ID: "))
+                    qtd = int(input("Qtd: "))
+                    self.realizar_venda(pid, qtd, usuario)
+                except:
+                    print("❌ Erro!")
+            elif op == '4':
+                self.listar_produtos()
+                try:
+                    pid = int(input("ID: "))
+                    qtd = int(input("Qtd: "))
+                    custo = float(input("Custo total: "))
+                    self.registrar_compra(pid, qtd, custo, usuario)
+                except:
+                    print("❌ Erro!")
+            elif op == '5':
+                self.relatorio_vendas()
+            elif op == '6':
+                self.cadastrar_usuario()
+            elif op == '7':
+                break
+            input("\n⏸️ Enter...")
+    
+    def main(self):
+        print("🚀 SISTEMA COMERCIAL v4.0 🚀")
+        print("Admin padrão: admin / admin123")
         
-        escolha = input("\nEscolha: ")
-        
-        if escolha == '1':
-            cargo = fazer_login()
-            if cargo == 'admin':
-                print("\n✨ Acesso de Administrador confirmado.")
-                menu_admin()
-            elif cargo == 'vendedor':
-                print("\n✨ Acesso de Vendedor confirmado.")
-                menu_vendedor()
-            else:
-                print("\n❌ Usuário ou senha incorretos.")
-        elif escolha == '2':
-            cadastrar_usuario()
-        elif escolha == '3':
-            print("Encerrando programa... Até logo!")
-            break
-        else:
-            print("Opção inválida.")
+        while True:
+            print("\n" + "="*40)
+            print("     🎯 MENU PRINCIPAL")
+            print("="*40)
+            print("1. 🔐 Login")
+            print("2. ➕ Usuário")
+            print("3. ❌ Sair")
+            
+            op = input("\n👉 ").strip()
+            
+            if op == '1':
+                cred = self.fazer_login()
+                if cred:
+                    usuario, cargo = cred
+                    print(f"\n✅ {cargo.upper()} logado!")
+                    if cargo == 'admin':
+                        self.menu_admin(usuario)
+                    else:
+                        self.menu_vendedor(usuario)
+                else:
+                    print("❌ Login inválido!")
+                input("\n⏸️ Enter...")
+            elif op == '2':
+                self.cadastrar_usuario()
+                input("\n⏸️ Enter...")
+            elif op == '3':
+                print("👋 Até logo!")
+                break
 
 if __name__ == "__main__":
-    main()
+    app = SistemaComercial()
+    app.main()

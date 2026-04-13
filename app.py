@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple, List
 
 # --- CONFIGURAÇÃO ---
-DB_NAME = 'comercial_v31.db'#nao alterar
+DB_NAME = 'comercial_v31.db'#NÃO MUDAR ESSA LINHA!!!
 BACKUP_DIR = 'backups'
 
 class SistemaComercial:
